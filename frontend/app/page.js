@@ -134,7 +134,13 @@ export default function HomePage() {
               placeholder="Ask me for directions or search for places..."
               autoComplete="off"
             />
+            <button id="micButton" className="mic-button" title="Voice input">
+              🎤
+            </button>
             <button id="sendButton">Send</button>
+            <button id="ttsToggle" className="tts-toggle" title="Toggle voice responses">
+              🔇
+            </button>
           </div>
         </div>
 

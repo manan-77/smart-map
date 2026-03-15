@@ -167,16 +167,40 @@ def normalize_vehicle(raw: str) -> str:
 
 
 def format_location_options(query: str, candidates: list) -> str:
-    """Format location candidates as a user-friendly message."""
-    response = f"I found {len(candidates)} locations for '{query}':\n\n"
-    for candidate in candidates:
-        response += f"{candidate['id']}. **{candidate['name']}**\n"
-        response += f"   📍 {candidate['address']}\n"
-        if candidate.get("distance_text"):
-            response += f"   📏 {candidate['distance_text']}\n"
-        response += "\n"
-    response += "Which one would you like? You can reply with a number, name, or ask me anything about these options."
-    return response
+    """Format location candidates as a conversational, voice-friendly message."""
+    n = len(candidates)
+    if n == 0:
+        return f"I couldn't find any locations for '{query}'."
+
+    # Build a flowing paragraph, closest first
+    parts = [f"I found {n} places matching '{query}'."]
+
+    for i, c in enumerate(candidates):
+        name = c.get('name', 'Unnamed')
+        address = c.get('address', '')
+        dist = c.get('distance_text', '')
+
+        # First candidate gets emphasis
+        if i == 0:
+            loc_desc = f"The closest is {name}"
+        elif i <= 2:
+            loc_desc = f"There's also {name}"
+        else:
+            # Summarize remaining
+            remaining = n - i
+            parts.append(f"Plus {remaining} more option{'s' if remaining > 1 else ''}.")
+            break
+
+        # Add address context (city/area only, not full address)
+        if address:
+            loc_desc += f" in {address}"
+        if dist:
+            loc_desc += f", about {dist} away"
+        loc_desc += "."
+        parts.append(loc_desc)
+
+    parts.append("Which one did you mean? Just say a number or the area name.")
+    return " ".join(parts)
 
 
 def format_candidates_for_llm(candidates: list) -> str:
@@ -203,6 +227,36 @@ def format_conversation_history(messages) -> str:
             content = msg.content[:200] + "..." if len(msg.content) > 200 else msg.content
             history_lines.append(f"Assistant: {content}")
     return "\n".join(history_lines) if history_lines else "(No prior conversation)"
+
+
+def build_route_response(route_data: dict, prefix: str = "", alternatives: list = None) -> str:
+    """Build a conversational, voice-friendly route response.
+
+    Returns a plain-text message with no emojis, markdown, or visual references.
+    The frontend still shows route cards, map markers and turn-by-turn panels
+    via the structured route_data — this text is purely conversational.
+    """
+    dist = route_data.get('distance_km', '?')
+    mins = route_data.get('time_minutes', '?')
+    origin = route_data.get('from', '?')
+    dest = route_data.get('to', '?')
+
+    # Round minutes to nearest integer for natural speech
+    if isinstance(mins, (int, float)):
+        mins = round(mins)
+
+    parts = []
+    if prefix:
+        parts.append(prefix.rstrip())
+
+    parts.append(f"Your route from {origin} to {dest} is about {dist} km, roughly {mins} minutes.")
+
+    if alternatives:
+        n = len(alternatives)
+        parts.append(f"I also found {n} alternate route{'s' if n > 1 else ''} if you're interested.")
+
+    parts.append("Feel free to ask me anything about this route, like highway details, road conditions, or turn-by-turn directions.")
+    return " ".join(parts)
 
 
 # ──────────────────────────────────────────────
@@ -515,16 +569,8 @@ def routing_node(state: SupervisorState):
         route_context = build_route_context(route_data)
         AgentLogger.info(f"Built route context ({len(route_context)} chars)")
         
-        # Build response mentioning alternatives
-        response = f"I found a route from {route_data['from']} to {route_data['to']}! It's {route_data['distance_km']} km and will take about {route_data['time_minutes']} minutes."
-        
-        if alternatives:
-            response += f"\n\n🗺️ I also found **{len(alternatives)} alternative route(s)** — shown in grey on the map. Click any grey route to switch to it!"
-            for i, alt in enumerate(alternatives):
-                sign = "+" if alt.get("time_diff_minutes", 0) >= 0 else ""
-                response += f"\n  • Route {i+2}: {alt['distance_km']} km ({sign}{alt.get('time_diff_minutes', 0)} min)"
-        
-        response += "\n\n💡 You can ask me anything about this route — highway details, lane counts, turn-by-turn directions, road surfaces, and more!"
+        # Build conversational response (no emojis/markdown)
+        response = build_route_response(route_data, prefix="Got it!", alternatives=alternatives)
         
         AgentLogger.agent_response(response)
         AgentLogger.node_exit("routing_node", "routing")
@@ -565,7 +611,7 @@ def search_node(state: SupervisorState):
 
         # Append a hint so the user knows they can pick one
         if pois and len(pois) > 1:
-            agent_response += "\n\nWould you like me to navigate to any of these? Just say which one (by number or name)."
+            agent_response += "\n\nWant me to navigate to any of these? Just tell me which one."
 
         AgentLogger.agent_response(agent_response)
         AgentLogger.node_exit("search_node", "search")
@@ -609,7 +655,11 @@ Conversation history:
 
 Current user message: {user_message}
 
-Respond naturally. Be concise, helpful, and enthusiastic about navigation."""
+IMPORTANT response formatting rules:
+- Respond in short, natural spoken sentences as if you were a friendly co-pilot.
+- NEVER use emojis, markdown formatting (no **bold**, no bullet points, no numbered lists).
+- NEVER reference visual elements like "shown on the map" or "click here".
+- Keep responses concise and conversational."""
     
     AgentLogger.llm_prompt("Conversation (Gemini)", conversation_prompt, num_context_messages=len(context_messages))
     
@@ -672,9 +722,11 @@ Conversation history:
 
 User's question: "{user_message}"
 
-Provide a clear, specific, data-backed answer. Use numbers and road names from the data above.
-Format your response nicely with bullet points or numbered lists when listing multiple items.
-Be conversational but precise."""
+IMPORTANT response formatting rules:
+- Answer in plain conversational sentences, like a helpful navigator sitting next to the user.
+- NEVER use emojis or markdown formatting (no **bold**, no bullet points, no numbered lists).
+- Use commas and natural sentence flow instead of lists.
+- Be precise with numbers and road names from the data but keep the tone natural."""
     
     AgentLogger.llm_prompt("Route Q&A (Gemini)", route_qa_prompt, num_context_messages=len(context_messages))
     
@@ -756,11 +808,12 @@ Analyze the user's response and determine their intent. Respond with ONLY valid 
 {{
     "action": "select" | "question" | "re_search" | "abandon",
     "selected_id": <MUST be an exact ID number from the candidates list above (1-{len(candidates)}). Only set when action is "select". null otherwise>,
-    "answer": "<natural language response to show the user>",
+    "answer": "<natural language response — plain conversational text, NO emojis, NO markdown, NO bullet points>",
     "new_search_query": "<new search query if action is re_search, null otherwise>"
 }}
 
 CRITICAL: When action is "select", the "selected_id" MUST exactly match one of the candidate IDs listed above. Double-check that the ID corresponds to the correct location name and address before responding.
+RESPONSE FORMAT: The "answer" field must be written as natural spoken English. Never use emojis, markdown, or bullet points. Keep it brief and conversational, like a co-pilot talking to the driver.
 
 Rules:
 - "select": User is picking a specific location (by number, name, description, city, or other identifier). The selected_id MUST match the candidate's ID number.
@@ -841,15 +894,7 @@ For "question": Answer their question, then ask which location they'd like."""
                     route_context = build_route_context(route_data)
                     AgentLogger.info(f"Built route context ({len(route_context)} chars)")
                     
-                    response = f"{answer}\n\nThe route is {route_data['distance_km']} km and will take about {route_data['time_minutes']} minutes."
-                    
-                    if alternatives:
-                        response += f"\n\n🗺️ I also found **{len(alternatives)} alternative route(s)** — shown in grey on the map. Click any grey route to switch to it!"
-                        for i, alt in enumerate(alternatives):
-                            sign = "+" if alt.get("time_diff_minutes", 0) >= 0 else ""
-                            response += f"\n  • Route {i+2}: {alt['distance_km']} km ({sign}{alt.get('time_diff_minutes', 0)} min)"
-                    
-                    response += "\n\n💡 You can now ask me anything about this route — highway details, lane counts, turn-by-turn directions, road surfaces, and more!"
+                    response = build_route_response(route_data, prefix=answer, alternatives=alternatives)
                     
                     AgentLogger.agent_response(response)
                     AgentLogger.node_exit("disambiguation_node", "routing")
@@ -924,13 +969,8 @@ For "question": Answer their question, then ask which location they'd like."""
                             vehicle = normalize_vehicle(routing_prefs.get("vehicle"))
                             route_data = routing_engine(location_a, location_b, vehicle=vehicle)
                             alternatives = route_data.get("alternative_routes", [])
-                            response = f"Found it! {chosen['name']} ({chosen['address']}). The route is {route_data['distance_km']} km and will take about {route_data['time_minutes']} minutes."
-                            
-                            if alternatives:
-                                response += f"\n\n🗺️ I also found **{len(alternatives)} alternative route(s)** — shown in grey on the map. Click any grey route to switch to it!"
-                                for i, alt in enumerate(alternatives):
-                                    sign = "+" if alt.get("time_diff_minutes", 0) >= 0 else ""
-                                    response += f"\n  • Route {i+2}: {alt['distance_km']} km ({sign}{alt.get('time_diff_minutes', 0)} min)"
+                            prefix = f"Found it! {chosen['name']} in {chosen['address']}."
+                            response = build_route_response(route_data, prefix=prefix, alternatives=alternatives)
                             
                             AgentLogger.agent_response(response)
                             return {

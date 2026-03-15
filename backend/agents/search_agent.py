@@ -74,9 +74,9 @@ def create_search_agent():
 
 
 def _format_tool_results(tool_messages) -> str:
-    """Format raw tool results into a readable response when LLM summarization fails."""
+    """Format raw tool results into a conversational response when LLM summarization fails."""
     all_pois = []
-    
+
     for msg in tool_messages:
         try:
             content = msg.content
@@ -84,30 +84,30 @@ def _format_tool_results(tool_messages) -> str:
                 data = json.loads(content)
             else:
                 data = content
-            
+
             if isinstance(data, dict) and "pois" in data:
                 all_pois.extend(data["pois"])
             elif isinstance(data, list):
                 all_pois.extend(data)
         except (json.JSONDecodeError, TypeError):
             pass
-    
+
     if not all_pois:
         return "I searched but couldn't find any results nearby. Try a different search or location."
-    
-    response = f"I found {len(all_pois)} places nearby:\n\n"
-    for i, poi in enumerate(all_pois[:10], 1):
+
+    parts = [f"I found {len(all_pois)} places nearby."]
+    for i, poi in enumerate(all_pois[:5], 1):
         name = poi.get("name", "Unnamed")
         dist = poi.get("distance_km", "")
-        dist_str = f" ({dist} km away)" if dist else ""
+        dist_str = f", about {dist} km away" if dist else ""
         address = poi.get("address", "")
-        addr_str = f"\n   📍 {address}" if address else ""
-        response += f"{i}. **{name}**{dist_str}{addr_str}\n"
-    
-    if len(all_pois) > 10:
-        response += f"\n...and {len(all_pois) - 10} more."
-    
-    return response
+        addr_str = f" on {address}" if address else ""
+        parts.append(f"{i} is {name}{addr_str}{dist_str}.")
+
+    if len(all_pois) > 5:
+        parts.append(f"There are {len(all_pois) - 5} more as well.")
+
+    return " ".join(parts)
 
 
 def run_search_agent(query: str, route_data: dict = None, location: dict = None):
@@ -155,7 +155,13 @@ def run_search_agent(query: str, route_data: dict = None, location: dict = None)
 - ALWAYS use the user's current location coordinates when available.
 - Default radius: 5000 meters. Increase to 10000 if few results.
 - After getting results, summarize them clearly with names and distances, sorted by distance (nearest first).
-- If no results found, suggest increasing radius or trying a different POI type."""
+- If no results found, suggest increasing radius or trying a different POI type.
+
+## RESPONSE FORMAT (critical):
+- Write your response as natural conversational text, like a co-pilot talking to the driver.
+- NEVER use emojis or markdown formatting (no **bold**, no bullet points, no numbered lists).
+- Mention the closest result first with its distance.
+- Keep it brief and natural. Example: 'I found 3 hospitals nearby. The closest is City Hospital, about 1.2 km away.'"""
     
     context = ""
     if route_data:

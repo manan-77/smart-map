@@ -16,12 +16,14 @@ from pathlib import Path
 # Add parent directory to path so 'backend' package is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import Optional, List
 import uuid
 import json
+import re
 
 from backend.agents.supervisor_agent import run_supervisor, call_gemini_api
 from backend.auth.auth0 import get_current_user
@@ -42,6 +44,7 @@ from backend.services.expiry_job import start_expiry_scheduler, stop_expiry_sche
 from backend.persistence.checkpointer import get_checkpointer, shutdown_pool
 from backend.database.db import init_db, SessionLocal
 from backend.tools.waze_tool import get_waze_alerts_and_jams
+from backend.config import ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID
 
 app = FastAPI(
     title="Nav AI Assistant API",
@@ -549,6 +552,107 @@ async def root():
             "user-knowledge-base",
         ]
     }
+
+# ── Voice: STT + TTS ─────────────────────────
+
+def sanitize_text_for_tts(text: str) -> str:
+    """Clean agent response text so it sounds natural when spoken by TTS.
+    
+    Strips coordinates, rounds decimals, removes markdown, etc.
+    """
+    # Remove coordinate patterns like "23.0225, 72.5714" or "(23.02, 72.57)"
+    text = re.sub(r'\(?-?\d{1,3}\.\d{2,},\s*-?\d{1,3}\.\d{2,}\)?', '', text)
+    # Remove phrases like "at coordinates ..." or "GPS: ..."
+    text = re.sub(r'(at coordinates|GPS:?)\s*[\d.,\s()-]+', '', text, flags=re.IGNORECASE)
+    
+    # Round decimal distances: "25.3 km" → "25 km"
+    def round_unit(m):
+        return f"{round(float(m.group(1)))} {m.group(2)}"
+    text = re.sub(r'(\d+\.\d+)\s*(km|miles?|mi|meters?|m|minutes?|min|hours?|hr)', round_unit, text)
+    
+    # Remove markdown bold/italic
+    text = re.sub(r'\*{1,2}(.+?)\*{1,2}', r'\1', text)
+    # Remove markdown bullet points
+    text = re.sub(r'^\s*[•\-\*]\s+', '', text, flags=re.MULTILINE)
+    # Convert numbered lists to flowing text
+    text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
+    
+    # Collapse multiple spaces/newlines
+    text = re.sub(r'\n{2,}', '. ', text)
+    text = re.sub(r'\n', ' ', text)
+    text = re.sub(r'\s{2,}', ' ', text)
+    
+    return text.strip()
+
+
+class TTSRequest(BaseModel):
+    text: str
+
+
+@app.post("/stt")
+async def speech_to_text(file: UploadFile = File(...), user=Depends(get_current_user)):
+    """Transcribe audio using ElevenLabs Scribe v2."""
+    if not ELEVENLABS_API_KEY:
+        raise HTTPException(status_code=500, detail="ElevenLabs API key not configured")
+    
+    import requests as http_requests
+    
+    audio_bytes = await file.read()
+    
+    try:
+        resp = http_requests.post(
+            "https://api.elevenlabs.io/v1/speech-to-text",
+            headers={"xi-api-key": ELEVENLABS_API_KEY},
+            data={"model_id": "scribe_v2"},
+            files={"file": (file.filename or "audio.webm", audio_bytes, file.content_type or "audio/webm")},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        return {"text": result.get("text", "")}
+    except http_requests.exceptions.HTTPError as e:
+        raise HTTPException(status_code=resp.status_code, detail=f"ElevenLabs STT error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"STT failed: {str(e)}")
+
+
+@app.post("/tts")
+async def text_to_speech(req: TTSRequest, user=Depends(get_current_user)):
+    """Convert text to speech using ElevenLabs TTS."""
+    if not ELEVENLABS_API_KEY:
+        raise HTTPException(status_code=500, detail="ElevenLabs API key not configured")
+    
+    import requests as http_requests
+    
+    clean_text = sanitize_text_for_tts(req.text)
+    if not clean_text:
+        raise HTTPException(status_code=400, detail="No text to speak after sanitization")
+    
+    voice_id = ELEVENLABS_VOICE_ID or "JBFqnCBsd6RMkjVDRZzb"
+    
+    try:
+        resp = http_requests.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json={
+                "text": clean_text,
+                "model_id": "eleven_multilingual_v2",
+                "voice_settings": {
+                    "stability": 0.5,
+                    "similarity_boost": 0.75,
+                },
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return Response(content=resp.content, media_type="audio/mpeg")
+    except http_requests.exceptions.HTTPError as e:
+        raise HTTPException(status_code=resp.status_code, detail=f"ElevenLabs TTS error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS failed: {str(e)}")
 
 
 # ── Lifecycle ────────────────────────────────

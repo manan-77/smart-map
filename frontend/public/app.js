@@ -128,11 +128,20 @@ getUserLocation();
 const chatMessages = document.getElementById('chatMessages');
 const chatInput = document.getElementById('chatInput');
 const sendButton = document.getElementById('sendButton');
+const micButton = document.getElementById('micButton');
+const ttsToggle = document.getElementById('ttsToggle');
 const startNavButton = document.getElementById('startNavigationButton');
 const navigationPanel = document.getElementById('navigationPanel');
 const navigationInstructionEl = document.getElementById('navigationInstruction');
 const navigationMetaEl = document.getElementById('navigationMeta');
 const stopNavButton = document.getElementById('stopNavigationButton');
+
+// ── Voice state ──
+let mediaRecorder = null;
+let audioChunks = [];
+let isRecording = false;
+let ttsEnabled = false;  // off by default, toggled by button or auto-enabled on voice input
+let currentAudio = null; // currently playing TTS audio
 
 // Sign icons for turn-by-turn
 const SIGN_ICONS = {
@@ -576,6 +585,11 @@ async function sendMessage() {
 
         addMessage(data.message, false, data.route_data, data.intent);
 
+        // TTS playback for agent response
+        if (ttsEnabled && data.message) {
+            playTTS(data.message);
+        }
+
         if (data.route_data && data.route_data.polyline) {
             candidateLayer.clearLayers();
             drawRoute(data.route_data);
@@ -606,6 +620,148 @@ async function sendMessage() {
 
 if (sendButton) sendButton.addEventListener('click', sendMessage);
 if (chatInput) chatInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendMessage(); });
+
+
+// ──────────────────────────────────────────────
+// VOICE: STT + TTS
+// ──────────────────────────────────────────────
+
+// ── TTS Toggle ──
+if (ttsToggle) {
+    ttsToggle.addEventListener('click', () => {
+        ttsEnabled = !ttsEnabled;
+        ttsToggle.textContent = ttsEnabled ? '🔈' : '🔇';
+        ttsToggle.classList.toggle('active', ttsEnabled);
+        ttsToggle.title = ttsEnabled ? 'Voice responses ON' : 'Voice responses OFF';
+        // Stop any playing audio when disabling
+        if (!ttsEnabled && currentAudio) {
+            currentAudio.pause();
+            currentAudio = null;
+        }
+    });
+}
+
+// ── TTS Playback ──
+async function playTTS(text) {
+    try {
+        const token = window.getAccessToken ? window.getAccessToken() : null;
+        if (!token) return;
+
+        // Stop any currently playing audio
+        if (currentAudio) {
+            currentAudio.pause();
+            currentAudio = null;
+        }
+
+        const resp = await fetch('http://localhost:8000/tts', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`
+            },
+            body: JSON.stringify({ text })
+        });
+
+        if (!resp.ok) {
+            console.warn('TTS failed:', resp.status);
+            return;
+        }
+
+        const audioBlob = await resp.blob();
+        const audioUrl = URL.createObjectURL(audioBlob);
+        currentAudio = new Audio(audioUrl);
+        currentAudio.addEventListener('ended', () => {
+            URL.revokeObjectURL(audioUrl);
+            currentAudio = null;
+        });
+        currentAudio.play();
+    } catch (err) {
+        console.warn('TTS playback error:', err);
+    }
+}
+
+// ── Mic Button: Voice Recording ──
+if (micButton) {
+    micButton.addEventListener('click', async () => {
+        if (isRecording) {
+            // Stop recording
+            mediaRecorder.stop();
+            return;
+        }
+
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+            audioChunks = [];
+
+            mediaRecorder.ondataavailable = (e) => {
+                if (e.data.size > 0) audioChunks.push(e.data);
+            };
+
+            mediaRecorder.onstop = async () => {
+                // Clean up recording state
+                isRecording = false;
+                micButton.classList.remove('recording');
+                micButton.classList.add('processing');
+                micButton.textContent = '⏳';
+                stream.getTracks().forEach(t => t.stop());
+
+                const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+
+                try {
+                    const token = window.getAccessToken ? window.getAccessToken() : null;
+                    if (!token) throw new Error('Not authenticated');
+
+                    const formData = new FormData();
+                    formData.append('file', audioBlob, 'recording.webm');
+
+                    const resp = await fetch('http://localhost:8000/stt', {
+                        method: 'POST',
+                        headers: { 'Authorization': `Bearer ${token}` },
+                        body: formData
+                    });
+
+                    if (!resp.ok) throw new Error(`STT HTTP ${resp.status}`);
+
+                    const data = await resp.json();
+                    const transcribed = (data.text || '').trim();
+
+                    if (transcribed) {
+                        // Auto-enable TTS when using voice input
+                        ttsEnabled = true;
+                        if (ttsToggle) {
+                            ttsToggle.textContent = '🔈';
+                            ttsToggle.classList.add('active');
+                            ttsToggle.title = 'Voice responses ON';
+                        }
+
+                        // Put text in input and send
+                        chatInput.value = transcribed;
+                        sendMessage();
+                    } else {
+                        addMessage('I didn\'t catch that. Please try again.', false);
+                    }
+                } catch (err) {
+                    console.error('STT error:', err);
+                    addMessage('Voice transcription failed. Please try typing instead.', false);
+                } finally {
+                    micButton.classList.remove('processing');
+                    micButton.textContent = '🎤';
+                }
+            };
+
+            // Start recording
+            mediaRecorder.start();
+            isRecording = true;
+            micButton.classList.add('recording');
+            micButton.textContent = '⏹️';
+
+        } catch (err) {
+            console.error('Microphone access denied:', err);
+            addMessage('Microphone access was denied. Please allow mic access in your browser settings.', false);
+        }
+    });
+}
 
 
 // ──────────────────────────────────────────────
