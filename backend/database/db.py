@@ -54,6 +54,10 @@ def init_db():
                 "ALTER TABLE user_knowledge ADD COLUMN IF NOT EXISTS "
                 "display_category VARCHAR DEFAULT 'general'"
             ))
+            conn.execute(text(
+                "ALTER TABLE user_knowledge ADD COLUMN IF NOT EXISTS "
+                "last_used_at TIMESTAMPTZ DEFAULT NOW()"
+            ))
             conn.commit()
         except Exception:
             pass  # Column already exists or table doesn't exist yet

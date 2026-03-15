@@ -275,43 +275,91 @@ def get_user_knowledge(db: Session, user_id: str) -> list[UserKnowledge]:
     )
 
 
-def build_knowledge_context(db: Session, user_id: str) -> str:
+import math
+
+# Max knowledge items to inject into the system prompt
+MAX_KNOWLEDGE_ITEMS = 8
+
+
+def build_knowledge_context(db: Session, user_id: str, user_message: str = "") -> str:
     """
     Build text context from the user's knowledge base for system prompt injection.
 
-    Only includes:
-    - explicit items with confidence >= 0.4
-    - inferred items with confidence >= 0.5 AND occurrence_count >= 2
+    Scoring formula per item:
+        score = confidence × recency_weight × log2(occurrence_count + 1) × relevance_boost
+
+    - recency_weight decays over days since last use (1.0 → 0.3 over 30 days)
+    - relevance_boost is 2.0 if the item's key/value matches keywords in the current message
+    - Safety filter: explicit items need confidence >= 0.4; inferred need >= 0.5 AND 2+ occurrences
+    - Only the top 8 items are injected.
     """
     items = (
         db.query(UserKnowledge)
         .filter(UserKnowledge.user_id == user_id)
-        .order_by(UserKnowledge.confidence.desc())
-        .limit(25)
         .all()
     )
 
     if not items:
         return ""
 
-    # Filter by safety rules
-    trusted = []
-    for item in items:
-        if item.safety_level == "explicit" and item.confidence >= 0.4:
-            trusted.append(item)
-        elif item.safety_level == "inferred" and item.confidence >= 0.5 and item.occurrence_count >= 2:
-            trusted.append(item)
+    now = datetime.now(timezone.utc)
+    msg_lower = user_message.lower() if user_message else ""
 
-    if not trusted:
+    scored = []
+    for item in items:
+        # Safety gate
+        if item.safety_level == "inferred":
+            if item.confidence < 0.5 or item.occurrence_count < 2:
+                continue
+        elif item.safety_level == "explicit":
+            if item.confidence < 0.4:
+                continue
+
+        # Recency weight: 1.0 for today → 0.3 after 30 days
+        last_used = item.last_used_at or item.updated_at or item.created_at
+        days_ago = max((now - last_used).total_seconds() / 86400, 0) if last_used else 0
+        recency = max(0.3, 1.0 - (days_ago / 30) * 0.7)
+
+        # Occurrence weight (logarithmic — diminishing returns)
+        occ_weight = math.log2((item.occurrence_count or 1) + 1)
+
+        # Relevance boost: check if key, type, or value description matches the message
+        relevance = 1.0
+        if msg_lower:
+            key_words = item.key.replace("_", " ").lower().split()
+            type_words = item.knowledge_type.replace("_", " ").lower().split()
+            value_desc = ""
+            if isinstance(item.value, dict):
+                value_desc = str(item.value.get("description", "")).lower()
+
+            match_words = key_words + type_words
+            if any(w in msg_lower for w in match_words if len(w) > 2):
+                relevance = 2.0
+            elif value_desc and any(w in msg_lower for w in value_desc.split() if len(w) > 3):
+                relevance = 1.5
+
+        score = item.confidence * recency * occ_weight * relevance
+        scored.append((score, item))
+
+    if not scored:
         return ""
 
-    lines = ["Known information about this user (from previous conversations):"]
+    # Sort by score descending, take top 8
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top_items = scored[:MAX_KNOWLEDGE_ITEMS]
 
-    for item in trusted:
+    # Update last_used_at for selected items
+    for _, item in top_items:
+        item.last_used_at = now
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    lines = [f"Known information about this user (top {len(top_items)} from memory):"]
+    for _, item in top_items:
         value_str = json.dumps(item.value) if isinstance(item.value, dict) else str(item.value)
-        lines.append(
-            f"- [{item.knowledge_type}] {item.key}: {value_str}"
-        )
+        lines.append(f"- [{item.knowledge_type}] {item.key}: {value_str}")
 
     return "\n".join(lines)
 

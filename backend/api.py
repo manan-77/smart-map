@@ -16,7 +16,7 @@ from pathlib import Path
 # Add parent directory to path so 'backend' package is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -24,6 +24,13 @@ from typing import Optional, List
 import uuid
 import json
 import re
+import os
+import logging
+from sqlalchemy import text
+
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from backend.agents.supervisor_agent import run_supervisor, call_gemini_api
 from backend.auth.auth0 import get_current_user
@@ -46,11 +53,31 @@ from backend.database.db import init_db, SessionLocal
 from backend.tools.waze_tool import get_waze_alerts_and_jams
 from backend.config import ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID
 
+# ── Application Setup ────────────────────────
+
+# Setup Rate Limiting
+limiter = Limiter(key_func=get_remote_address)
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    start_expiry_scheduler()
+    yield
+    # Shutdown
+    stop_expiry_scheduler()
+    shutdown_pool()
+
 app = FastAPI(
     title="Nav AI Assistant API",
     version="3.0.0",
-    description="AI-powered navigation assistant with stateful conversation support and user knowledge base"
+    description="AI-powered navigation assistant with stateful conversation support and user knowledge base",
+    lifespan=lifespan
 )
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Initialize PostgreSQL checkpointer (creates tables on first run)
 checkpointer = get_checkpointer()
@@ -61,10 +88,13 @@ init_db()
 # Redis for user↔session auth mapping only
 session_manager = SessionManager()
 
-# Enable CORS
+# Enable CORS — restrict to known frontend origins
+_allowed = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000")
+ALLOWED_ORIGINS = [o.strip() for o in _allowed.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -110,8 +140,10 @@ def get_db():
 # ── Endpoints ────────────────────────────────
 
 @app.post("/chat", response_model=ChatResponse)
+@limiter.limit("10/minute")
 async def chat(
-    request: ChatRequest,
+    request: Request,
+    body: ChatRequest,
     current_user: dict = Depends(get_current_user)
 ):
     """
@@ -123,8 +155,11 @@ async def chat(
     as the thread_id.
     """
     try:
+        if len(body.message) > 2000:
+            raise HTTPException(status_code=400, detail="Message too long (max 2000 characters)")
+            
         user_id = current_user["user_id"]
-        session_id = request.session_id or str(uuid.uuid4())
+        session_id = body.session_id or str(uuid.uuid4())
         
         # Map session to user (auth concern — stays in Redis)
         session_manager.save_user_mapping(session_id, user_id)
@@ -132,19 +167,19 @@ async def chat(
         # Upsert conversation record in the conversations table
         db = SessionLocal()
         try:
-            upsert_conversation(db, session_id, user_id, request.message)
+            upsert_conversation(db, session_id, user_id, body.message)
             
-            # Build knowledge context from user's knowledge base
-            knowledge_context = build_knowledge_context(db, user_id)
+            # Build knowledge context — top 8 most relevant items
+            knowledge_context = build_knowledge_context(db, user_id, body.message)
         finally:
             db.close()
         
         # Run stateful supervisor — checkpointer handles all state
         result = run_supervisor(
-            user_message=request.message,
+            user_message=body.message,
             session_id=session_id,
             checkpointer=checkpointer,
-            location=request.user_location,
+            location=body.user_location,
             user_id=user_id,
             knowledge_context=knowledge_context if knowledge_context else None,
         )
@@ -158,15 +193,20 @@ async def chat(
             alternative_routes=result.get("alternative_routes"),
             intent=result.get("intent")
         )
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Log the actual error, but return a generic 500 to avoid leaking internals
+        logging.error(f"Chat error: {e}")
+        raise HTTPException(status_code=500, detail="An internal server error occurred while processing your request.")
 
 
 # ── Conversation Management Endpoints ────────
 
 @app.get("/conversations")
+@limiter.limit("30/minute")
 async def list_conversations(
+    request: Request,
     current_user: dict = Depends(get_current_user)
 ):
     """List all conversations for the authenticated user."""
@@ -182,8 +222,10 @@ async def list_conversations(
 
 
 @app.get("/conversations/{session_id}")
+@limiter.limit("30/minute")
 async def load_conversation(
     session_id: str,
+    request: Request,
     current_user: dict = Depends(get_current_user)
 ):
     """
@@ -198,6 +240,8 @@ async def load_conversation(
         
         # Get messages from checkpointer
         try:
+            from langchain_core.messages import HumanMessage as HMsg, AIMessage as AMsg
+            
             config = {"configurable": {"thread_id": session_id}}
             state = checkpointer.get(config)
             
@@ -208,7 +252,7 @@ async def load_conversation(
                     "route_data": None,
                 }
             
-            checkpoint_data = state.checkpoint
+            checkpoint_data = state
             channel_values = checkpoint_data.get("channel_values", {})
             messages = channel_values.get("messages", [])
             route_data = channel_values.get("route_data")
@@ -216,8 +260,18 @@ async def load_conversation(
             
             formatted_messages = []
             for msg in messages:
+                # Only include user and assistant messages — skip
+                # ToolMessage, SystemMessage, and other internal types
+                if not isinstance(msg, (HMsg, AMsg)):
+                    continue
+                
+                content = getattr(msg, 'content', '') or ''
+                
+                # Skip messages with empty content
+                if not content.strip():
+                    continue
+                
                 # Skip system context messages injected by knowledge system
-                content = msg.content
                 if content.startswith("[SYSTEM CONTEXT"):
                     # Extract only the user message part
                     marker = "User message: "
@@ -227,8 +281,9 @@ async def load_conversation(
                     else:
                         continue
                 
+                role = "user" if isinstance(msg, HMsg) else "assistant"
                 formatted_messages.append({
-                    "role": "user" if hasattr(msg, 'type') and msg.type == "human" else "assistant",
+                    "role": role,
                     "content": content,
                 })
             
@@ -240,6 +295,8 @@ async def load_conversation(
             }
         except Exception as e:
             print(f"Error loading conversation state: {e}")
+            import traceback
+            traceback.print_exc()
             return {
                 **conv.to_dict(),
                 "messages": [],
@@ -250,8 +307,10 @@ async def load_conversation(
 
 
 @app.delete("/conversations/{session_id}")
+@limiter.limit("15/minute")
 async def remove_conversation(
     session_id: str,
+    request: Request,
     current_user: dict = Depends(get_current_user)
 ):
     """Delete a conversation."""
@@ -267,16 +326,18 @@ async def remove_conversation(
 
 
 @app.patch("/conversations/{session_id}")
+@limiter.limit("15/minute")
 async def update_conversation(
     session_id: str,
-    request: RenameConversationRequest,
+    body: RenameConversationRequest,
+    request: Request,
     current_user: dict = Depends(get_current_user)
 ):
     """Rename a conversation."""
     db = SessionLocal()
     try:
         user_id = current_user["user_id"]
-        conv = rename_conversation(db, session_id, user_id, request.title)
+        conv = rename_conversation(db, session_id, user_id, body.title)
         if conv is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         return conv.to_dict()
@@ -287,7 +348,9 @@ async def update_conversation(
 # ── Knowledge Endpoints ──────────────────────
 
 @app.get("/knowledge")
+@limiter.limit("30/minute")
 async def get_knowledge(
+    request: Request,
     current_user: dict = Depends(get_current_user)
 ):
     """Return the user's knowledge base."""
@@ -303,8 +366,10 @@ async def get_knowledge(
 
 
 @app.post("/conversations/{session_id}/summarize")
+@limiter.limit("10/minute")
 async def summarize_conversation(
     session_id: str,
+    request: Request,
     current_user: dict = Depends(get_current_user)
 ):
     """
@@ -356,7 +421,7 @@ async def get_session_history(
             return {"session_id": session_id, "messages": [], "route_data": None}
         
         # Extract messages from checkpoint state
-        checkpoint_data = state.checkpoint
+        checkpoint_data = state
         channel_values = checkpoint_data.get("channel_values", {})
         messages = channel_values.get("messages", [])
         route_data = channel_values.get("route_data")
@@ -382,8 +447,10 @@ async def get_session_history(
 # ── Route Analysis ───────────────────────────
 
 @app.post("/analyze-route")
+@limiter.limit("5/minute")
 async def analyze_route(
-    request: AnalyzeRouteRequest,
+    body: AnalyzeRouteRequest,
+    request: Request,
     current_user: dict = Depends(get_current_user)
 ):
     """
@@ -394,7 +461,7 @@ async def analyze_route(
     3. Returns aggregated alerts and jams for map rendering
     """
     try:
-        route_data = request.route_data
+        route_data = body.route_data
 
         # Build compact route summary for the LLM
         instructions_summary = []
@@ -508,8 +575,8 @@ Return at most 5 bottlenecks. Return ONLY valid JSON, no markdown."""
         }
 
     except Exception as e:
-        print(f"Analyze route error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(f"Analyze route error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to analyze route traffic. Please try again.")
 
 
 # ── Health & Info ────────────────────────────
@@ -527,10 +594,14 @@ async def health():
         status["redis"] = f"error: {str(e)}"
         status["status"] = "degraded"
     
-    # Check PostgreSQL (via checkpointer)
+    # Check PostgreSQL
     try:
-        # Simple check — if checkpointer exists, pool is alive
-        status["postgres"] = "connected"
+        db = SessionLocal()
+        try:
+            db.execute(text("SELECT 1"))
+            status["postgres"] = "connected"
+        finally:
+            db.close()
     except Exception as e:
         status["postgres"] = f"error: {str(e)}"
         status["status"] = "degraded"
@@ -590,7 +661,8 @@ class TTSRequest(BaseModel):
 
 
 @app.post("/stt")
-async def speech_to_text(file: UploadFile = File(...), user=Depends(get_current_user)):
+@limiter.limit("10/minute")
+async def speech_to_text(file: UploadFile = File(...), user=Depends(get_current_user), request: Request = None):
     """Transcribe audio using ElevenLabs Scribe v2."""
     if not ELEVENLABS_API_KEY:
         raise HTTPException(status_code=500, detail="ElevenLabs API key not configured")
@@ -613,11 +685,13 @@ async def speech_to_text(file: UploadFile = File(...), user=Depends(get_current_
     except http_requests.exceptions.HTTPError as e:
         raise HTTPException(status_code=resp.status_code, detail=f"ElevenLabs STT error: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"STT failed: {str(e)}")
+        logging.error(f"STT Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to parse audio")
 
 
 @app.post("/tts")
-async def text_to_speech(req: TTSRequest, user=Depends(get_current_user)):
+@limiter.limit("15/minute")
+async def text_to_speech(req: TTSRequest, user=Depends(get_current_user), request: Request = None):
     """Convert text to speech using ElevenLabs TTS."""
     if not ELEVENLABS_API_KEY:
         raise HTTPException(status_code=500, detail="ElevenLabs API key not configured")
@@ -652,22 +726,13 @@ async def text_to_speech(req: TTSRequest, user=Depends(get_current_user)):
     except http_requests.exceptions.HTTPError as e:
         raise HTTPException(status_code=resp.status_code, detail=f"ElevenLabs TTS error: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"TTS failed: {str(e)}")
+        logging.error(f"TTS Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate speech")
 
 
-# ── Lifecycle ────────────────────────────────
+# ── Lifecycle (Deprecated) ───────────────────
+# Note: Handled by 'lifespan' context manager above
 
-@app.on_event("startup")
-def on_startup():
-    """Start background scheduler on app startup."""
-    start_expiry_scheduler()
-
-
-@app.on_event("shutdown")
-def on_shutdown():
-    """Clean up database connections and scheduler on shutdown."""
-    stop_expiry_scheduler()
-    shutdown_pool()
 
 
 if __name__ == "__main__":

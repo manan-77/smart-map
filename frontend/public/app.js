@@ -2,6 +2,11 @@
 // Nav AI — Interactive Map Application
 // ──────────────────────────────────────────────
 
+// API base URL — auto-detects localhost vs production
+const API_BASE = window.location.hostname === 'localhost'
+    ? 'http://localhost:8000'
+    : (window.__NAV_AI_API_BASE__ || `${window.location.origin}/api`);
+
 let currentSessionId = null;
 let userLocation = null;
 let userLocationMarker = null;
@@ -564,7 +569,7 @@ async function sendMessage() {
         const token = window.getAccessToken ? window.getAccessToken() : null;
         if (!token) throw new Error('Not authenticated');
 
-        const response = await fetch('http://localhost:8000/chat', {
+        const response = await fetch(`${API_BASE}/chat`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -653,7 +658,7 @@ async function playTTS(text) {
             currentAudio = null;
         }
 
-        const resp = await fetch('http://localhost:8000/tts', {
+        const resp = await fetch(`${API_BASE}/tts`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -715,7 +720,7 @@ if (micButton) {
                     const formData = new FormData();
                     formData.append('file', audioBlob, 'recording.webm');
 
-                    const resp = await fetch('http://localhost:8000/stt', {
+                    const resp = await fetch(`${API_BASE}/stt`, {
                         method: 'POST',
                         headers: { 'Authorization': `Bearer ${token}` },
                         body: formData
@@ -836,7 +841,7 @@ async function fetchTrafficData(routeData) {
         chatMessages.appendChild(trafficMsg);
         chatMessages.scrollTop = chatMessages.scrollHeight;
 
-        const response = await fetch('http://localhost:8000/analyze-route', {
+        const response = await fetch(`${API_BASE}/analyze-route`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -1021,7 +1026,7 @@ async function loadConversations() {
         const token = window.getAccessToken ? window.getAccessToken() : null;
         if (!token) return;
 
-        const response = await fetch('http://localhost:8000/conversations', {
+        const response = await fetch(`${API_BASE}/conversations`, {
             headers: { 'Authorization': `Bearer ${token}` }
         });
 
@@ -1077,14 +1082,14 @@ function renderConversationList(conversations) {
 }
 
 // Switch to a different conversation
-async function switchConversation(sessionId) {
-    if (sessionId === currentSessionId) return;
+async function switchConversation(sessionId, forceReload = false) {
+    if (sessionId === currentSessionId && !forceReload) return;
 
     try {
         const token = window.getAccessToken ? window.getAccessToken() : null;
         if (!token) return;
 
-        const response = await fetch(`http://localhost:8000/conversations/${sessionId}`, {
+        const response = await fetch(`${API_BASE}/conversations/${sessionId}`, {
             headers: { 'Authorization': `Bearer ${token}` }
         });
 
@@ -1146,7 +1151,7 @@ function newChat() {
         const oldSessionId = currentSessionId;
         const token = window.getAccessToken ? window.getAccessToken() : null;
         if (token) {
-            fetch(`http://localhost:8000/conversations/${oldSessionId}/summarize`, {
+            fetch(`${API_BASE}/conversations/${oldSessionId}/summarize`, {
                 method: 'POST',
                 headers: { 'Authorization': `Bearer ${token}` }
             }).then(() => {
@@ -1194,7 +1199,7 @@ async function deleteConversation(sessionId) {
         const token = window.getAccessToken ? window.getAccessToken() : null;
         if (!token) return;
 
-        const response = await fetch(`http://localhost:8000/conversations/${sessionId}`, {
+        const response = await fetch(`${API_BASE}/conversations/${sessionId}`, {
             method: 'DELETE',
             headers: { 'Authorization': `Bearer ${token}` }
         });
@@ -1246,11 +1251,30 @@ if (chatInput) {
     chatInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendMessage(); });
 }
 
-// Load conversations when auth is ready (custom event from auth-client.js)
-window.addEventListener('navai-auth-ready', () => {
+// Initialize data that depends on authentication (conversations + knowledge)
+function initAuthDependentData() {
+    const token = window.getAccessToken ? window.getAccessToken() : null;
+    if (!token) return;
+
     setTimeout(loadConversations, 300);
     setTimeout(loadKnowledge, 500);
-});
+
+    // Auto-load the last conversation if one was saved in localStorage
+    if (currentSessionId) {
+        setTimeout(() => switchConversation(currentSessionId, true), 600);
+    }
+}
+
+// Load conversations when auth is ready (custom event from auth-client.js),
+// but also handle the case where auth was ready before this script loaded.
+if (window.navaiAuthReady) {
+    // Auth was already initialized before app.js registered the listener
+    initAuthDependentData();
+} else {
+    window.addEventListener('navai-auth-ready', () => {
+        initAuthDependentData();
+    });
+}
 
 
 // ──────────────────────────────────────────────
@@ -1307,7 +1331,7 @@ async function loadKnowledge() {
         const token = window.getAccessToken ? window.getAccessToken() : null;
         if (!token) return;
 
-        const response = await fetch('http://localhost:8000/knowledge', {
+        const response = await fetch(`${API_BASE}/knowledge`, {
             headers: { 'Authorization': `Bearer ${token}` }
         });
 

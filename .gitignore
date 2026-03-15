@@ -13,6 +13,12 @@ env/
 .vscode/
 .idea/
 
+# Next.js Build Output
+frontend/.next/
+
+# Python Virtual Environments
+.venv/
+
 # OS
 .DS_Store
 Thumbs.db

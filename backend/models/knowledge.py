@@ -26,6 +26,7 @@ class UserKnowledge(Base):
     confidence = Column(Float, default=0.5)                # 0.0-1.0, grows with repetition
     occurrence_count = Column(Integer, default=1)
     source_sessions = Column(JSON, default=list)           # session_ids that contributed
+    last_used_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # last time injected into prompt
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
@@ -45,6 +46,7 @@ class UserKnowledge(Base):
             "safety_level": self.safety_level,
             "confidence": self.confidence,
             "occurrence_count": self.occurrence_count,
+            "last_used_at": self.last_used_at.isoformat() if self.last_used_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }

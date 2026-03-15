@@ -1,10 +1,10 @@
 // Next.js-friendly Auth0 client wrapper (copied from legacy auth.js)
 
-// Auth0 configuration
+// Auth0 configuration — loaded from globals (browser-safe, no Node `process`)
 const auth0Config = {
-  domain: 'dev-x417ljvag4ramrdf.us.auth0.com',
-  clientId: 'ArOSpOmzgJ9JMyAJqEPOj8jE1Tv8H7uE',
-  audience: 'https://dev-x417ljvag4ramrdf.us.auth0.com/api/v2/',
+  domain: (window.__NAV_AI_AUTH0_DOMAIN__ || window.NEXT_PUBLIC_AUTH0_DOMAIN || 'YOUR_AUTH0_DOMAIN'),
+  clientId: (window.__NAV_AI_AUTH0_CLIENT_ID__ || window.NEXT_PUBLIC_AUTH0_CLIENT_ID || 'YOUR_AUTH0_CLIENT_ID'),
+  audience: (window.__NAV_AI_AUTH0_AUDIENCE__ || window.NEXT_PUBLIC_AUTH0_AUDIENCE || 'YOUR_AUTH0_AUDIENCE'),
   redirectUri: window.location.origin
 };
 
@@ -136,7 +136,9 @@ function unlockChat() {
         </div>
     `;
 
-  // Notify app.js that auth is ready so conversation sidebar can load
+  // Notify app.js that auth is ready so conversation sidebar can load.
+  // Also set a flag so late listeners can detect that auth is already ready.
+  window.navaiAuthReady = true;
   window.dispatchEvent(new CustomEvent('navai-auth-ready'));
 }
 

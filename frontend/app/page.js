@@ -9,6 +9,14 @@ export default function HomePage() {
         src="https://cdn.auth0.com/js/auth0-spa-js/2.1/auth0-spa-js.production.js"
         strategy="beforeInteractive"
       />
+      {/* Expose Auth0 config to window for public/auth-client.js */}
+      <Script id="nav-ai-auth0-env" strategy="beforeInteractive">
+        {`
+          window.__NAV_AI_AUTH0_DOMAIN__ = ${JSON.stringify(process.env.NEXT_PUBLIC_AUTH0_DOMAIN || '')};
+          window.__NAV_AI_AUTH0_CLIENT_ID__ = ${JSON.stringify(process.env.NEXT_PUBLIC_AUTH0_CLIENT_ID || '')};
+          window.__NAV_AI_AUTH0_AUDIENCE__ = ${JSON.stringify(process.env.NEXT_PUBLIC_AUTH0_AUDIENCE || '')};
+        `}
+      </Script>
       <Script
         src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         strategy="afterInteractive"
